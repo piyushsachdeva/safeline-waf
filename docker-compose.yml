@@ -1,0 +1,210 @@
+networks:
+  safeline-ce:
+    name: safeline-ce
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - gateway: ${SUBNET_PREFIX:?SUBNET_PREFIX required}.1
+          subnet: ${SUBNET_PREFIX}.0/24
+    driver_opts:
+      com.docker.network.bridge.name: safeline-ce
+  n8n-network:
+    name: n8n-network
+    driver: bridge
+
+services:
+  # ============================================
+  # WAF SafeLine Services
+  # ============================================
+  postgres:
+    container_name: safeline-pg
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-postgres${ARCH_SUFFIX}:15.2
+    volumes:
+      - ${SAFELINE_DIR}/resources/postgres/data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - POSTGRES_USER=safeline-ce
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?postgres password required}
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.2
+    command: [postgres, -c, max_connections=600]
+    healthcheck:
+      test: pg_isready -U safeline-ce -d safeline-ce
+
+  mgt:
+    container_name: safeline-mgt
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-mgt${REGION}${ARCH_SUFFIX}:${IMAGE_TAG:?image tag required}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${SAFELINE_DIR}/resources/mgt:/app/data
+      - ${SAFELINE_DIR}/logs/nginx:/app/log/nginx:z
+      - ${SAFELINE_DIR}/resources/sock:/app/sock
+      - /var/run:/app/run
+    ports:
+      - ${MGT_PORT:-9443}:1443
+    healthcheck:
+      test: curl -k -f https://localhost:1443/api/open/health
+    environment:
+      - MGT_PG=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+      - MGT_PROXY=${MGT_PROXY}
+    depends_on:
+      - postgres
+      - fvm
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.4
+
+  detect:
+    container_name: safeline-detector
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-detector${REGION}${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - ${SAFELINE_DIR}/resources/detector:/resources/detector
+      - ${SAFELINE_DIR}/logs/detector:/logs/detector
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - LOG_DIR=/logs/detector
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.5
+
+  tengine:
+    container_name: safeline-tengine
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-tengine${REGION}${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/resolv.conf:/etc/resolv.conf:ro
+      - ${SAFELINE_DIR}/resources/nginx:/etc/nginx
+      - ${SAFELINE_DIR}/resources/detector:/resources/detector
+      - ${SAFELINE_DIR}/resources/chaos:/resources/chaos
+      - ${SAFELINE_DIR}/logs/nginx:/var/log/nginx:z
+      - ${SAFELINE_DIR}/resources/cache:/usr/local/nginx/cache
+      - ${SAFELINE_DIR}/resources/sock:/app/sock
+    environment:
+      - TCD_MGT_API=https://${SUBNET_PREFIX}.4:1443/api/open/publish/server
+      - TCD_SNSERVER=${SUBNET_PREFIX}.5:8000
+      - SNSERVER_ADDR=${SUBNET_PREFIX}.5:8000
+      - CHAOS_ADDR=${SUBNET_PREFIX}.10
+    ulimits:
+      nofile: 131072
+    network_mode: host
+
+  luigi:
+    container_name: safeline-luigi
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-luigi${REGION}${ARCH_SUFFIX}:${IMAGE_TAG}
+    environment:
+      - MGT_IP=${SUBNET_PREFIX}.4
+      - LUIGI_PG=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${SAFELINE_DIR}/resources/luigi:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    depends_on:
+      - detect
+      - mgt
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.7
+
+  fvm:
+    container_name: safeline-fvm
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-fvm${REGION}${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.8
+
+  chaos:
+    container_name: safeline-chaos
+    restart: always
+    image: ${IMAGE_PREFIX}/safeline-chaos${REGION}${ARCH_SUFFIX}:${IMAGE_TAG}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+    environment:
+      - DB_ADDR=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+    volumes:
+      - ${SAFELINE_DIR}/resources/sock:/app/sock
+      - ${SAFELINE_DIR}/resources/chaos:/app/chaos
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.10
+
+  # ============================================
+  # n8n Service
+  # ============================================
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: always
+    ports:
+      - "5678:5678"  
+    environment:
+      # Basic n8n configuration
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-http}
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:5678/}
+      
+      # Database configuration - using dedicated PostgreSQL for n8n
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=n8n-postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${N8N_DB_NAME:-n8n}
+      - DB_POSTGRESDB_USER=${N8N_DB_USER:-n8n}
+      - DB_POSTGRESDB_PASSWORD=${N8N_DB_PASSWORD}
+      
+      # Timezone
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-UTC}
+      
+      # Security
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE:-true}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+    volumes:
+      - ${N8N_DIR:-./n8n-data}:/home/node/.n8n
+      - ${N8N_FILES_DIR:-./n8n-files}:/files
+    networks:
+      - n8n-network
+    depends_on:
+      - n8n-postgres
+
+  # ============================================
+  # Dedicated PostgreSQL for n8n
+  # ============================================
+  n8n-postgres:
+    image: postgres:15
+    container_name: n8n-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=${N8N_DB_USER:-n8n}
+      - POSTGRES_PASSWORD=${N8N_DB_PASSWORD}
+      - POSTGRES_DB=${N8N_DB_NAME:-n8n}
+    volumes:
+      - ${N8N_POSTGRES_DIR:-./n8n-postgres-data}:/var/lib/postgresql/data
+    networks:
+      - n8n-network
